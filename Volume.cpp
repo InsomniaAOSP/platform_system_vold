@@ -46,8 +46,11 @@
 #include "ResponseCode.h"
 #include "Ext4.h"
 #include "Fat.h"
+#include "Ntfs.h"
+#include "Exfat.h"
 #include "Process.h"
 #include "cryptfs.h"
+#include "VoldUtil.h"
 
 #ifndef FUSE_SDCARD_UID
 #define FUSE_SDCARD_UID 1023
@@ -60,7 +63,7 @@
 #define DO_STRINGIFY(str) #str
 #define STRINGIFY(str) DO_STRINGIFY(str)
 
-static char SDCARD_DAEMON_PATH[] = "/system/bin/sdcard";
+static char SDCARD_DAEMON_PATH[] = HELPER_PATH "sdcard";
 
 extern "C" void dos_partition_dec(void const *pp, struct dos_partition *d);
 extern "C" void dos_partition_enc(void *pp, struct dos_partition *d);
@@ -107,7 +110,7 @@ const char *Volume::LOOPDIR           = "/mnt/obb";
 const char *Volume::FUSEDIR           = "/mnt/fuse";
 
 
-static const char *stateToStr(int state) {
+extern "C" const char *stateToStr(int state) {
     if (state == Volume::State_Init)
         return "Initializing";
     else if (state == Volume::State_NoMedia)
@@ -133,6 +136,7 @@ static const char *stateToStr(int state) {
 }
 
 Volume::Volume(VolumeManager *vm, const char *label, const char *mount_point) {
+    char switchable[PROPERTY_VALUE_MAX];
     mVm = vm;
     mDebug = false;
     mLabel = strdup(label);
@@ -141,6 +145,30 @@ Volume::Volume(VolumeManager *vm, const char *label, const char *mount_point) {
     mCurrentlyMountedKdev = -1;
     mPartIdx = -1;
     mRetryMount = false;
+    mLunNumber = -1;
+
+    property_get("persist.sys.vold.switchexternal", switchable, "0");
+    if (!strcmp(switchable,"1")) {
+        char *first, *second = NULL;
+        const char *delim = ",";
+
+        property_get("ro.vold.switchablepair", switchable, "");
+
+        if (!(first = strtok(switchable, delim))) {
+            SLOGE("Mount switch requested, but no switchable mountpoints found");
+            return;
+        } else if (!(second = strtok(NULL, delim))) {
+            SLOGE("Mount switch requested, but bad switchable mountpoints found");
+            return;
+        }
+        if (!strcmp(mount_point,first)) {
+                free(mMountpoint);
+                mMountpoint = strdup(second);
+        } else if (!strcmp(mount_point,second)) {
+                free(mMountpoint);
+                mMountpoint = strdup(first);
+        }
+    }
 }
 
 Volume::~Volume() {
@@ -206,6 +234,15 @@ int Volume::handleBlockEvent(NetlinkEvent *evt) {
     return -1;
 }
 
+bool Volume::isPrimaryStorage() {
+    const char* externalStorage = getenv("EXTERNAL_STORAGE") ? : "/mnt/sdcard";
+    return !strcmp(getMountpoint(), externalStorage);
+}
+
+void Volume::setLunNumber(int lunNumber) {
+    mLunNumber = lunNumber;
+}
+
 void Volume::setState(int state) {
     char msg[255];
     int oldState = mState;
@@ -243,7 +280,9 @@ int Volume::createDeviceNode(const char *path, int major, int minor) {
     return 0;
 }
 
-int Volume::formatVol() {
+int Volume::formatVol(const char* fstype) {
+
+    const char* fstype2 = NULL;
 
     if (getState() == Volume::State_NoMedia) {
         errno = ENODEV;
@@ -283,16 +322,43 @@ int Volume::formatVol() {
     sprintf(devicePath, "/dev/block/vold/%d:%d",
             MAJOR(partNode), MINOR(partNode));
 
+#ifdef VOLD_EMMC_SHARES_DEV_MAJOR
+    // If emmc and sdcard share dev major number, vold may pick
+    // incorrectly based on partition nodes alone, formatting
+    // the wrong device. Use device nodes instead.
+    dev_t deviceNodes;
+    getDeviceNodes((dev_t *) &deviceNodes, 1);
+    sprintf(devicePath, "/dev/block/vold/%d:%d", MAJOR(deviceNodes), MINOR(deviceNodes));
+#endif
+
+    if (fstype == NULL) {
+        fstype2 = getFsType((const char*)devicePath);
+
+        if (fstype2 == NULL) {
+            // There is no valid file system on the card
+            fstype2 = "vfat";
+        }
+    } else {
+        fstype2 = fstype;
+    }
+
     if (mDebug) {
-        SLOGI("Formatting volume %s (%s)", getLabel(), devicePath);
+        SLOGI("Formatting volume %s (%s) as %s", getLabel(), devicePath, fstype2);
     }
 
-    if (Fat::format(devicePath, 0)) {
+    if (strcmp(fstype2, "exfat") == 0) {
+        ret = Exfat::format(devicePath);
+    } else if (strcmp(fstype2, "ext4") == 0) {
+        ret = Ext4::format(devicePath, NULL);
+    } else if (strcmp(fstype2, "ntfs") == 0) {
+        ret = Ntfs::format(devicePath);
+    } else {
+        ret = Fat::format(devicePath, 0);
+    }
+
+    if (ret < 0) {
         SLOGE("Failed to format (%s)", strerror(errno));
-        goto err;
     }
-
-    ret = 0;
 
 err:
     setState(Volume::State_Idle);
@@ -329,8 +395,7 @@ int Volume::mountVol() {
     dev_t deviceNodes[4];
     int n, i, rc = 0;
     char errmsg[255];
-    const char* externalStorage = getenv("EXTERNAL_STORAGE");
-    bool primaryStorage = externalStorage && !strcmp(getMountpoint(), externalStorage);
+    bool primaryStorage = isPrimaryStorage();
     char decrypt_state[PROPERTY_VALUE_MAX];
     char crypto_state[PROPERTY_VALUE_MAX];
     char encrypt_progress[PROPERTY_VALUE_MAX];
@@ -389,14 +454,14 @@ int Volume::mountVol() {
 
        if (n != 1) {
            /* We only expect one device node returned when mounting encryptable volumes */
-           SLOGE("Too many device nodes returned when mounting %d\n", getMountpoint());
+           SLOGE("Too many device nodes returned when mounting %s\n", getMountpoint());
            return -1;
        }
 
        if (cryptfs_setup_volume(getLabel(), MAJOR(deviceNodes[0]), MINOR(deviceNodes[0]),
                                 new_sys_path, sizeof(new_sys_path),
                                 &new_major, &new_minor)) {
-           SLOGE("Cannot setup encryption mapping for %d\n", getMountpoint());
+           SLOGE("Cannot setup encryption mapping for %s\n", getMountpoint());
            return -1;
        }
        /* We now have the new sysfs path for the decrypted block device, and the
@@ -482,6 +547,31 @@ int Volume::mountVol() {
 
                 if (Ext4::doMount(devicePath, "/mnt/secure/staging", false, false, false)) {
                     SLOGE("%s failed to mount via EXT4 (%s)\n", devicePath, strerror(errno));
+                    continue;
+                }
+
+            } else if (strcmp(fstype, "ntfs") == 0) {
+
+                if (Ntfs::doMount(devicePath, "/mnt/secure/staging", false, false, false,
+                        AID_SYSTEM, gid, 0702, true)) {
+                    SLOGE("%s failed to mount via NTFS (%s)\n", devicePath, strerror(errno));
+                    continue;
+                }
+
+            } else if (strcmp(fstype, "exfat") == 0) {
+
+                if (Exfat::check(devicePath)) {
+                    errno = EIO;
+                    /* Badness - abort the mount */
+                    SLOGE("%s failed FS checks (%s)", devicePath, strerror(errno));
+                    setState(Volume::State_Idle);
+                    free(fstype);
+                    return -1;
+                }
+
+                if (Exfat::doMount(devicePath, "/mnt/secure/staging", false, false, false,
+                        AID_SYSTEM, gid, 0702)) {
+                    SLOGE("%s failed to mount via EXFAT (%s)\n", devicePath, strerror(errno));
                     continue;
                 }
 
@@ -759,24 +849,27 @@ int Volume::unmountVol(bool force, bool revert) {
     setState(Volume::State_Unmounting);
     usleep(1000 * 1000); // Give the framework some time to react
 
-    /*
-     * Remove the bindmount we were using to keep a reference to
-     * the previously obscured directory.
-     */
-    if (doUnmount(Volume::SEC_ASECDIR_EXT, force)) {
-        SLOGE("Failed to remove bindmount on %s (%s)", SEC_ASECDIR_EXT, strerror(errno));
-        goto fail_remount_tmpfs;
-    }
+    /* Undo createBindMounts(), which is only called for primary storage */
+    if (isPrimaryStorage()) {
+        /*
+         * Remove the bindmount we were using to keep a reference to
+         * the previously obscured directory.
+         */
+        if (doUnmount(Volume::SEC_ASECDIR_EXT, force)) {
+            SLOGE("Failed to remove bindmount on %s (%s)", SEC_ASECDIR_EXT, strerror(errno));
+            goto fail_remount_tmpfs;
+        }
 
-    /*
-     * Unmount the tmpfs which was obscuring the asec image directory
-     * from non root users
-     */
-    char secure_dir[PATH_MAX];
-    snprintf(secure_dir, PATH_MAX, "%s/.android_secure", getMountpoint());
-    if (doUnmount(secure_dir, force)) {
-        SLOGE("Failed to unmount tmpfs on %s (%s)", secure_dir, strerror(errno));
-        goto fail_republish;
+        /*
+         * Unmount the tmpfs which was obscuring the asec image directory
+         * from non root users
+         */
+        char secure_dir[PATH_MAX];
+        snprintf(secure_dir, PATH_MAX, "%s/.android_secure", getMountpoint());
+        if (doUnmount(secure_dir, force)) {
+            SLOGE("Failed to unmount tmpfs on %s (%s)", secure_dir, strerror(errno));
+            goto fail_republish;
+        }
     }
 
     /*
